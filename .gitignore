@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Local runtime and credentials
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+node_modules/
+
+# Local application logs
+review-app/logs/*.log
+# Project data and local records
+objects/
+docs/
