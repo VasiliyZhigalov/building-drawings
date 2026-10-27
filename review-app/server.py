@@ -4,19 +4,14 @@ import hashlib
 import json
 import math
 import mimetypes
-import re
 import shutil
 import threading
 import uuid
 import xml.etree.ElementTree as ET
-import unicodedata
 from datetime import datetime
-from email import policy
-from email.parser import BytesParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlparse
-from tempfile import TemporaryDirectory
 
 ROOT = Path(__file__).resolve().parents[1]
 STATIC = Path(__file__).resolve().parent / 'static'
@@ -62,99 +57,6 @@ def source_path(obj, name):
         base=(project/folder).resolve(); candidate=(base/name).resolve()
         if candidate.parent==base and candidate.is_file(): return candidate
     raise ValueError('Исходный файл не найден')
-
-
-def slugify(value):
-    value=unicodedata.normalize('NFC',str(value or '')).strip()
-    value=re.sub(r'[^\w.-]+','_',value,flags=re.UNICODE).strip('._-')
-    return value[:100].rstrip('._-')
-
-
-def next_object_id():
-    used=set()
-    for p in OBJECTS.glob('Объект-*'):
-        match=re.fullmatch(r'Объект-(\d+)',p.name)
-        if match:used.add(int(match.group(1)))
-    n=1
-    while n in used:n+=1
-    return f'Объект-{n:03d}'
-
-
-def parse_multipart(content_type, body):
-    message=BytesParser(policy=policy.default).parsebytes(
-        b'Content-Type: '+content_type.encode('ascii')+b'\r\nMIME-Version: 1.0\r\n\r\n'+body)
-    if not message.is_multipart():raise ValueError('Ожидается multipart-форма')
-    fields={};files=[]
-    for part in message.iter_parts():
-        name=part.get_param('name',header='content-disposition')
-        if not name:continue
-        filename=part.get_filename()
-        if filename is not None:
-            data=part.get_payload(decode=True) or b''
-            if data:files.append({'field':name,'filename':filename,'mime':part.get_content_type(),'data':data})
-        else:
-            data=part.get_payload(decode=True) or b''
-            charset=part.get_content_charset()
-            encodings=[charset,'utf-8'] if charset else ['utf-8']
-            decoded=None
-            for encoding in dict.fromkeys(encodings):
-                try:
-                    decoded=data.decode(encoding,errors='strict')
-                    break
-                except (LookupError,UnicodeDecodeError):
-                    continue
-            if decoded is None:raise ValueError(f'Не удалось прочитать поле формы «{name}»: ожидается UTF-8')
-            fields[name]=decoded
-    return fields,files
-
-
-def create_project(fields, uploads):
-    try:brief=json.loads(fields.get('brief','{}'))
-    except (TypeError,json.JSONDecodeError) as exc:raise ValueError('Не удалось прочитать параметры объекта') from exc
-    if not isinstance(brief,dict):raise ValueError('Параметры объекта должны быть JSON-объектом')
-    if len(uploads)>50:raise ValueError('Можно загрузить не более 50 файлов за один раз')
-    address=str(brief.get('address','')).strip()
-    title=str(brief.get('title','')).strip()
-    object_id=slugify(address) if address else next_object_id()
-    if not object_id:object_id=next_object_id()
-    destination=(OBJECTS/object_id).resolve()
-    if destination.parent!=OBJECTS.resolve():raise ValueError('Некорректное имя объекта')
-    if destination.exists():raise FileExistsError(f'Объект с таким именем уже существует: {object_id}')
-    normalized=[];seen=set();total=0
-    allowed={'.png','.jpg','.jpeg','.webp','.tif','.tiff','.bmp','.pdf','.dxf','.dwg','.doc','.docx','.xls','.xlsx','.csv','.txt','.rtf','.json','.zip'}
-    for upload in uploads:
-        basename=Path(str(upload['filename']).replace('\\','/')).name
-        basename=''.join(ch for ch in basename if ch.isprintable()).strip().strip('.')
-        suffix=Path(basename).suffix.lower()
-        if not basename or suffix not in allowed:raise ValueError(f'Неподдерживаемый тип файла: {basename or upload["filename"]}')
-        key=basename.casefold()
-        if key in seen:raise ValueError(f'Файл загружен повторно: {basename}')
-        seen.add(key);total+=len(upload['data'])
-        if len(upload['data'])>100*1024*1024:raise ValueError(f'Файл больше 100 МБ: {basename}')
-        if total>400*1024*1024:raise ValueError('Общий объём файлов превышает 400 МБ')
-        match=re.fullmatch(r'source_(\d+)',upload['field'])
-        category=str(fields.get('source_category_'+match.group(1),'другое')) if match else 'другое'
-        normalized.append({**upload,'filename':basename,'category':category})
-    if not address:brief['address']=''
-    brief.update({'schema_version':1,'object_id':object_id,'title':title,'created_at':datetime.now().astimezone().isoformat(),
-                  'recorded_by':'user_web_form','blank_fields_mean':'unknown','status':'brief_only','sources':[]})
-    with LOCK:
-        if destination.exists():raise FileExistsError(f'Объект с таким именем уже существует: {object_id}')
-        with TemporaryDirectory(prefix='.new-object-',dir=OBJECTS) as temporary:
-            work=Path(temporary)
-            for folder in ('sources','references','models','scripts','output'): (work/folder).mkdir()
-            records=[]
-            for upload in normalized:
-                path=work/'sources'/upload['filename']
-                path.write_bytes(upload['data'])
-                record={'filename':upload['filename'],'category':upload['category'],'mime':upload['mime'],
-                        'size':len(upload['data']),'sha256':hashlib.sha256(upload['data']).hexdigest(),
-                        'stored_path':'sources/'+upload['filename']}
-                records.append(record)
-            brief['sources']=records
-            (work/'models'/'brief.json').write_text(json.dumps(brief,ensure_ascii=False,indent=2),encoding='utf-8')
-            work.rename(destination)
-    return {'id':object_id,'name':(title or object_id.replace('_',' ')),'path':str(destination),'source_count':len(normalized)}
 
 
 def catalog():
@@ -369,24 +271,16 @@ class Handler(BaseHTTPRequestHandler):
             print(repr(exc),flush=True);self.reply({'error':'Не удалось открыть чертёж: '+str(exc)},500)
     def do_POST(self):
         try:
-            route=urlparse(self.path).path
-            if route not in ('/api/reviews','/api/projects'):return self.reply({'error':'Не найдено'},404)
+            if urlparse(self.path).path!='/api/reviews':return self.reply({'error':'Не найдено'},404)
             origin=self.headers.get('Origin')
             if origin and origin!=f'http://{self.headers.get("Host")}':
                 return self.reply({'error':'Недопустимый источник запроса'},403)
+            if not self.headers.get('Content-Type','').startswith('application/json'):
+                return self.reply({'error':'Ожидается JSON'},415)
             size=int(self.headers.get('Content-Length','0'))
-            max_size=450*1024*1024 if route=='/api/projects' else 2_000_000
-            if not 0<size<max_size:raise ValueError('Некорректный размер запроса')
-            content_type=self.headers.get('Content-Type','')
-            raw=self.rfile.read(size)
-            if route=='/api/projects':
-                if not content_type.startswith('multipart/form-data;'):return self.reply({'error':'Ожидается форма с файлами'},415)
-                fields,uploads=parse_multipart(content_type,raw)
-                result=create_project(fields,uploads)
-            else:
-                if not content_type.startswith('application/json'):return self.reply({'error':'Ожидается JSON'},415)
-                payload=json.loads(raw)
-                with LOCK:result=save_review(payload)
+            if not 0<size<2_000_000:raise ValueError('Некорректный размер запроса')
+            payload=json.loads(self.rfile.read(size))
+            with LOCK:result=save_review(payload)
             self.reply(result,201)
         except FileExistsError as exc:self.reply({'error':str(exc)},409)
         except (ValueError,KeyError,TypeError) as exc:self.reply({'error':str(exc)},400)

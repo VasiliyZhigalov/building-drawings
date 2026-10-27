@@ -9,7 +9,7 @@ A local toolkit for reconstructing editable building plans and elevations from s
 - `review-app/` contains the local browser interface for viewing drawings, comparing them with source scans, and saving review notes.
 - `skills/building-drawings.zip` is the reusable Codex skill for drawing reconstruction workflows.
 
-The review interface can create a new project brief, save optional building measurements and reconstruction preferences, and copy uploaded source materials into the new project's local `sources/` folder. It preselects the user's usual drawing scope and black linework; building-specific facts stay blank until provided. Project data is intentionally excluded from this public repository.
+Create objects and provide source materials through the chat. The review interface displays existing objects, drawings and source materials.
 
 ## Run the review interface
 
