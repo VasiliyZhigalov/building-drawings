@@ -19,12 +19,19 @@ OBJECTS = ROOT / 'objects'
 LOCK = threading.RLock()
 KINDS = {'comment':'Замечание','move':'Переместить','delete':'Удалить','add':'Добавить',
          'align':'Выровнять','resize':'Изменить размер','joint':'Исправить стык'}
+ELEMENTS = {'other':'Элемент','wall':'Стена','window':'Окно','balcony':'Балкон / лоджия',
+            'stairs':'Лестница','door':'Дверь','roof':'Крыша'}
 SVG = 'http://www.w3.org/2000/svg'
 ET.register_namespace('', SVG)
 
 
 def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def scoped_pointer(project, sha, drawing):
+    key=hashlib.sha256(drawing.encode('utf-8')).hexdigest()[:16]
+    return project/'review'/f'latest-{sha}-{key}.json'
 
 
 def drawing_path(obj, name):
@@ -142,8 +149,8 @@ def coordinate(point, meta):
 
 
 def validate_annotations(items,meta):
-    if not isinstance(items,list) or not 1<=len(items)<=300:
-        raise ValueError('Добавьте от 1 до 300 замечаний')
+    if not isinstance(items,list) or len(items)>300:
+        raise ValueError('Можно сохранить не более 300 замечаний')
     result=[]; seen=set()
     for i,item in enumerate(items,1):
         ident=str(item.get('id',''))
@@ -159,9 +166,12 @@ def validate_annotations(items,meta):
             raise ValueError('Слишком длинное замечание')
         status=item.get('status','open')
         if status not in ('open','resolved'):raise ValueError('Неизвестный статус')
+        element=item.get('element_type','other')
+        if element not in ELEMENTS:raise ValueError('Неизвестный тип элемента')
         pts=item.get('points',[])
         if len(pts)!=(1 if shape=='point' else 2):raise ValueError('Недостаточно точек')
         result.append({'id':ident,'number':i,'action':kind,'action_label':KINDS[kind],
+                       'element_type':element,'element_label':ELEMENTS[element],
                        'shape':shape,'text':text,'value':value,'status':status,
                        'points':[coordinate(p,meta) for p in pts]})
     return result
@@ -198,6 +208,8 @@ def save_review(payload):
     project,path,cache,meta=prepare(payload.get('object'),payload.get('file'))
     if payload.get('sha256')!=meta['sha256']:
         raise FileExistsError('Чертёж изменился. Откройте его заново перед сохранением.')
+    if payload.get('annotations')==[] and payload.get('clear_all') is not True:
+        raise ValueError('Для удаления всех замечаний требуется явное подтверждение операции')
     items=validate_annotations(payload.get('annotations'),meta)
     revision='revision-'+datetime.now().astimezone().strftime('%Y%m%d-%H%M%S')+'-'+uuid.uuid4().hex[:6]
     destination=project/'review'/revision
@@ -215,17 +227,58 @@ def save_review(payload):
     (destination/'marked-preview.png').write_bytes(png)
     (destination/'comments.json').write_text(json.dumps(record,ensure_ascii=False,indent=2),encoding='utf-8')
     summary=[f'# Замечания: {payload["file"]}',f'Версия: {revision}',f'SHA256: {meta["sha256"]}','']
+    if not items:summary.append('Список замечаний очищен.')
     for item in items:
-        summary.append(f'{item["number"]}. {item["action_label"]} — {item["text"] or "См. отметку на чертеже"}')
+        summary.append(f'{item["number"]}. {item["element_label"]}: {item["action_label"]} — {item["text"] or "См. отметку на чертеже"}')
         if item['value']:summary.append(f'   Размер/значение: {item["value"]}')
         summary.append(f'   Статус: {item["status"]}; координаты CAD: '+str([p['cad'] for p in item['points']]))
     (destination/'comments.md').write_text('\n'.join(summary),encoding='utf-8')
     # Per-drawing pointer, written only after the complete revision exists.
-    pointer=project/'review'/f'latest-{meta["sha256"]}.json'
-    temporary=pointer.with_suffix('.tmp')
-    temporary.write_text(json.dumps({'revision':revision},ensure_ascii=False),encoding='utf-8')
-    temporary.replace(pointer)
+    canonical=meta['version']+'/'+path.name
+    for pointer in (scoped_pointer(project,meta['sha256'],canonical),project/'review'/f'latest-{meta["sha256"]}.json'):
+        temporary=pointer.with_suffix('.tmp')
+        temporary.write_text(json.dumps({'revision':revision},ensure_ascii=False),encoding='utf-8')
+        temporary.replace(pointer)
     return {'revision':revision,'path':str(destination),'count':len(items)}
+
+
+def review_results(obj, name):
+    """Read reports only when their source revision and both drawing hashes match."""
+    project, current, current_version = drawing_path(obj, name)
+    current_name=current_version+'/'+current.name
+    reports=[]
+    for report_path in sorted((project/'output').glob('v[0-9]*/review-results*.json')):
+        try:
+            report=json.loads(report_path.read_text(encoding='utf-8-sig'))
+            revision=report['source_revision']
+            if not isinstance(revision,str) or not revision.startswith('revision-') or Path(revision).name!=revision:
+                continue
+            revision_path=(project/'review'/revision/'comments.json').resolve()
+            if revision_path.parent.parent!=(project/'review').resolve():continue
+            original=json.loads(revision_path.read_text(encoding='utf-8-sig'))
+            source=report['source_drawing'];target=report['target_drawing']
+            _,source_path,source_version=drawing_path(obj,source)
+            _,target_path,target_version=drawing_path(obj,target)
+            if target_version!=report_path.parent.name:continue
+            if source!=source_version+'/'+source_path.name or target!=target_version+'/'+target_path.name:continue
+            original_drawings={source}
+            if source_version=='v1':original_drawings.add(source_path.name)
+            if original.get('object')!=obj or original.get('revision')!=revision or original.get('drawing') not in original_drawings:continue
+            if original.get('sha256')!=report.get('source_sha256') or digest(source_path)!=report.get('source_sha256'):continue
+            if digest(target_path)!=report.get('target_sha256'):continue
+            if current_name not in (source,target):continue
+            valid_items={item['id']:item for item in original.get('annotations',[])}
+            items=[]
+            for item in report.get('results',[]):
+                original_item=valid_items.get(item.get('annotation_id'))
+                if original_item and item.get('status') in ('resolved','needs_clarification','not_done'):
+                    items.append({'annotation_id':item['annotation_id'],'status':item['status'],
+                                  'number':original_item.get('number'),
+                                  'description':str(item.get('description',''))[:2000]})
+            reports.append({'source_revision':revision,'source_drawing':source,'target_drawing':target,'results':items})
+        except (OSError,ValueError,KeyError,TypeError,AttributeError,json.JSONDecodeError):
+            continue
+    return reports
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -242,6 +295,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             route,q=self.query()
             if route=='/api/projects':return self.reply(catalog())
+            if route=='/api/results':return self.reply(review_results(q.get('object'),q.get('file')))
             if route=='/api/brief':
                 obj=q.get('object','');project=(OBJECTS/obj).resolve()
                 if project.parent!=OBJECTS.resolve():raise ValueError('Объект не найден')
@@ -257,10 +311,16 @@ class Handler(BaseHTTPRequestHandler):
                 if route=='/api/preview':
                     if q.get('sha')!=meta['sha256']:return self.reply({'error':'Чертёж изменился'},409)
                     return self.reply((cache/'source.svg').read_bytes(),mime='image/svg+xml')
-                pointer=project/'review'/f'latest-{meta["sha256"]}.json'
+                canonical=meta['version']+'/'+path.name
+                pointer=scoped_pointer(project,meta['sha256'],canonical)
+                if not pointer.exists():pointer=project/'review'/f'latest-{meta["sha256"]}.json'
                 if not pointer.exists():return self.reply({'annotations':[]})
                 rev=json.loads(pointer.read_text(encoding='utf-8'))['revision']
                 record=json.loads((project/'review'/rev/'comments.json').read_text(encoding='utf-8'))
+                allowed_drawings={canonical}
+                if meta['version']=='v1':allowed_drawings.add(path.name)
+                if record.get('drawing') not in allowed_drawings or record.get('sha256')!=meta['sha256'] or record.get('object')!=q.get('object'):
+                    return self.reply({'annotations':[]})
                 return self.reply(record)
             allowed={'/':'index.html','/app.js':'app.js','/style.css':'style.css'}
             if route not in allowed:return self.reply({'error':'Не найдено'},404)
