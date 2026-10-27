@@ -92,7 +92,19 @@ def parse_multipart(content_type, body):
         if filename is not None:
             data=part.get_payload(decode=True) or b''
             if data:files.append({'field':name,'filename':filename,'mime':part.get_content_type(),'data':data})
-        else:fields[name]=part.get_content()
+        else:
+            data=part.get_payload(decode=True) or b''
+            charset=part.get_content_charset()
+            encodings=[charset,'utf-8'] if charset else ['utf-8']
+            decoded=None
+            for encoding in dict.fromkeys(encodings):
+                try:
+                    decoded=data.decode(encoding,errors='strict')
+                    break
+                except (LookupError,UnicodeDecodeError):
+                    continue
+            if decoded is None:raise ValueError(f'Не удалось прочитать поле формы «{name}»: ожидается UTF-8')
+            fields[name]=decoded
     return fields,files
 
 
